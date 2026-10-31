@@ -6,7 +6,9 @@ Přístup hlídá Bearer token ze souboru <data_root>/api-token; ZeroTier šifru
 
   GET    /health                     stav serveru (i kontrola tokenu)
   GET    /speakers                   mluvčí + statistiky
-  POST   /speakers                   {"name": …} nový mluvčí
+  POST   /speakers                   {"name": …, "language": …} nový mluvčí
+  POST   /speakers/<jméno>/language  {"language": …} změna jazyka hlasu bez nahrávek
+  GET    /languages                  dostupné jazyky
   GET    /next?speaker=…             další věta k nahrání
   POST   /transcribe?utterance=…     tělo = audio; STT + shoda, nic neukládá do datasetu
   POST   /save                       {"session","utterance","upload_id"} uloží PASS
@@ -35,6 +37,7 @@ from pathlib import Path
 
 from voice_trainer import dataset as ds
 from voice_trainer import db as dbmod
+from voice_trainer import languages
 from voice_trainer import stt as stt_mod
 from voice_trainer import training as tr
 
@@ -148,12 +151,12 @@ def transcribe_upload(cfg, db, utterance_id, body):
             raise ApiError(400, "nahrávku nejde přečíst")
         rms, peak, duration = audio_levels(wav)
         try:
-            text = stt_mod.transcribe(wav, cfg)
+            text = stt_mod.transcribe(wav, cfg, utt["language"])
         except OSError as e:
             dst.unlink(missing_ok=True)
             raise ApiError(502, f"STT nedostupné: {e}") from e
     threshold = float(cfg["recording"]["similarity_threshold"])
-    sim = stt_mod.similarity(utt["text"], text)
+    sim = stt_mod.similarity(utt["text"], text, utt["language"], cfg)
     # /save bere přepis odsud, ne z aplikace: rozhoduje, co slyšelo STT na serveru
     sidecar(dst).write_text(json.dumps({"utterance": utterance_id, "stt_text": text,
                                         "similarity": sim}, ensure_ascii=False))
@@ -256,6 +259,23 @@ def delete_recording(cfg, db, rid):
     return {"deleted": rid, "utterance_id": rec["utterance_id"]}
 
 
+def checked_language(cfg, data):
+    code = str(data.get("language") or languages.DEFAULT_LANGUAGE)
+    if code not in languages.available(cfg):
+        raise ApiError(400, f"neznámý jazyk {code}")
+    return code
+
+
+def set_language(cfg, db, name, data):
+    sid = db.speaker_id(name)
+    if sid is None:
+        raise ApiError(404, f"neznámý mluvčí {name}")
+    code = checked_language(cfg, data)
+    if db.speaker(sid)["language"] != code and db.speaker_has_data(sid):
+        raise ApiError(409, "hlas už má nahrávky, jazyk nejde změnit; pro jiný jazyk vytvoř nový hlas")
+    return run_cli(cfg, "speaker-language", "--name", name, "--language", code)
+
+
 def make_handler(cfg, token):
     class Handler(BaseHTTPRequestHandler):
         server_version = "voice-trainer-api"
@@ -313,11 +333,17 @@ def make_handler(cfg, token):
                         "training_running": tr.training_running(cfg)}
             if route == ("GET", "speakers"):
                 return run_cli(cfg, "speakers")
-            if route == ("POST", "speakers"):
-                name = str(self._data().get("name", "")).strip()
+            if route == ("GET", "languages"):
+                return run_cli(cfg, "languages")
+            if route == ("POST", "speakers") and len(parts) == 3 and parts[2] == "language":
+                return set_language(cfg, db, urllib.parse.unquote(parts[1]), self._data())
+            if route == ("POST", "speakers") and len(parts) == 1:
+                data = self._data()
+                name = str(data.get("name", "")).strip()
                 if not SPEAKER_NAME.match(name):
                     raise ApiError(400, "jméno smí mít jen písmena, číslice, mezeru a pomlčku")
-                return run_cli(cfg, "new-speaker", "--name", name)
+                return run_cli(cfg, "new-speaker", "--name", name,
+                               "--language", checked_language(cfg, data))
             if route == ("GET", "next"):
                 speaker = query.get("speaker", [""])[0]
                 if db.speaker_id(speaker) is None:

@@ -111,7 +111,8 @@ def main():
     max_epochs_total = base_epoch + int(req["max_epochs"])
     cmd = tr.build_fit_cmd(cfg, run_dir, req["sample_rate"],
                            base_for_fit, max_epochs_total,
-                           voice_name=req.get("speaker_name") or "voice-trainer")
+                           voice_name=req.get("speaker_name") or "voice-trainer",
+                           espeak_voice=req.get("espeak_voice"))
     log(run_dir, "fit: " + " ".join(cmd))
     env = {"NCCL_P2P_DISABLE": "1", "NCCL_IB_DISABLE": "1",
            "NCCL_DEBUG": "WARN", "PATH": "/usr/local/sbin:/usr/local/bin:"

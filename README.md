@@ -1,7 +1,7 @@
 # voice-trainer
 
-Serverová část pro trénink vlastního českého [Piper](https://github.com/OHF-Voice/piper1-gpl)
-TTS hlasu: dataset, kontrola nahrávek přes STT, trénink na GPU a export do ONNX.
+Serverová část pro trénink vlastního [Piper](https://github.com/OHF-Voice/piper1-gpl)
+TTS hlasu v češtině, angličtině nebo dalším jazyce: dataset, kontrola nahrávek přes STT, trénink na GPU a export do ONNX.
 Klient nahrává, server počítá.
 
 ```
@@ -52,6 +52,23 @@ Jiné umístění venv nastavíš proměnnou `VOICE_TRAINER_VENV`.
 - Po každých N PASS (default 10) se **automaticky spustí trénink** (detached).
 - Import hromadných vět: `voice-trainer import-text --file vety.txt`
   (formát `000001|věta` nebo čisté řádky).
+
+## Jazyky
+
+Jazyk patří k hlasu a určuje generování vět, kontrolu přes STT i fonémizaci při tréninku.
+Vestavěné jsou `cs` a `en`, další se doplní do `languages:` v `config.yaml`
+nebo do `voice_trainer/languages.py`.
+
+```bash
+voice-trainer new-speaker --name anna --language en
+voice-trainer speaker-language --name anna --language cs   # jen dokud hlas nemá nahrávky
+voice-trainer languages                                    # JSON, has_base = lze trénovat
+voice-trainer generate --language en
+voice-trainer import-text --file sentences.txt --language en
+```
+
+Trénink potřebuje základní model ve stejném jazyce (`training.bases.<název>.language`,
+výchozí `cs`). Bez něj jde nahrávat, ale trénink skončí chybou.
 
 ## HTTP API
 

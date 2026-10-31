@@ -69,7 +69,7 @@ def check_recording(db, cfg, rec):
             issues.append(f"too loud ({rms_db:.1f} dB RMS)")
     utt = db.utterance(rec["utterance_id"])
     if utt is not None and rec["stt_text"]:
-        sim = stt_mod.similarity(utt["text"], rec["stt_text"])
+        sim = stt_mod.similarity(utt["text"], rec["stt_text"], utt["language"], cfg)
         if sim < float(cfg["recording"]["similarity_threshold"]):
             issues.append(f"stt mismatch (sim {sim:.2f})")
     return issues, not issues

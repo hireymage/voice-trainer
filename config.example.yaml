@@ -23,6 +23,15 @@ llm_model: glm-5.3-flash:cloud
 llm_batch_size: 10        # kolik vět vygenerovat najednou
 llm_timeout: 120
 
+# ── jazyky hlasů ─────────────────────────────────────────────────────────────
+# Vestavěné jsou cs a en (voice_trainer/languages.py). Další jazyk stačí doplnit sem:
+# languages:
+#   de:
+#     name: Deutsch
+#     english_name: German     # pro zadání LLM
+#     espeak_voice: de         # výchozí je kód jazyka
+#     stt_language: de         # výchozí je kód jazyka
+
 # ── nahrávání ────────────────────────────────────────────────────────────────
 recording:
   sample_rate: 48000      # raw nahrávka na klientovi (mono)
@@ -42,6 +51,16 @@ training:
   precision: "32-true"    # Pascal nemá efektivní bf16; fp16 amp volitelně
   max_epochs: 500
   val_ratio: 0.02         # část datasetu pro validaci (min 1 nahrávka)
+  # Základní modely podle jazyka: hlas trénuje jen ze základu ve svém jazyce.
+  # bases:
+  #   jirka:
+  #     language: cs
+  #     checkpoint: /mnt/models/voice-trainer/piper1-gpl/jirka-medium.ckpt
+  #     config: /mnt/models/voice-trainer/piper1-gpl/jirka-medium-config.json
+  #   lessac:
+  #     language: en
+  #     checkpoint: /mnt/models/voice-trainer/piper1-gpl/lessac-medium.ckpt
+  #     config: /mnt/models/voice-trainer/piper1-gpl/lessac-medium-config.json
   # base checkpoint jirka-medium (stahuje fáze 4 setup, Hugging Face)
   base_checkpoint: /mnt/models/voice-trainer/piper1-gpl/jirka-medium.ckpt
   base_config: /mnt/models/voice-trainer/piper1-gpl/jirka-medium-config.json

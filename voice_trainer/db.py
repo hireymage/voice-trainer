@@ -16,12 +16,14 @@ CREATE TABLE IF NOT EXISTS utterances (
     id          INTEGER PRIMARY KEY,
     text        TEXT NOT NULL UNIQUE,
     source      TEXT NOT NULL DEFAULT 'llm',   -- llm | import | manual
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    language    TEXT NOT NULL DEFAULT 'cs'
 );
 CREATE TABLE IF NOT EXISTS speakers (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    language    TEXT NOT NULL DEFAULT 'cs'
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,              -- session_2026_09_25_001
@@ -107,10 +109,13 @@ class Db:
         add_col("recordings", "speaker_id", "INTEGER REFERENCES speakers(id)")
         add_col("runs", "speaker_id", "INTEGER REFERENCES speakers(id)")
         add_col("runs", "base_name", "TEXT")
+        # dosavadní hlasy a věty jsou české
+        add_col("utterances", "language", "TEXT NOT NULL DEFAULT 'cs'")
+        add_col("speakers", "language", "TEXT NOT NULL DEFAULT 'cs'")
         # backfill: pokud už existují nahrávky/runy bez speakeru, jsou to
         # data default mluvčího
-        has_rec = self.one("SELECT COUNT(*) n FROM recordings")["n"] > 0
-        has_run = self.one("SELECT COUNT(*) n FROM runs")["n"] > 0
+        has_rec = self.one("SELECT COUNT(*) n FROM recordings WHERE speaker_id IS NULL")["n"] > 0
+        has_run = self.one("SELECT COUNT(*) n FROM runs WHERE speaker_id IS NULL")["n"] > 0
         if has_rec or has_run:
             sp = self.one("SELECT id FROM speakers WHERE name = ?",
                           (DEFAULT_SPEAKER,))
@@ -151,16 +156,26 @@ class Db:
         row = self.one("SELECT id FROM speakers WHERE name = ?", (name,))
         return row["id"] if row else None
 
-    def ensure_speaker(self, name):
+    def ensure_speaker(self, name, language="cs"):
         name = name.strip()
         if not name:
             raise ValueError("jméno mluvčího je prázdné")
         sid = self.speaker_id(name)
         if sid is None:
-            self.q("INSERT INTO speakers (name, created_at) VALUES (?,?)",
-                   (name, now()))
+            self.q("INSERT INTO speakers (name, created_at, language) VALUES (?,?,?)",
+                   (name, now(), language))
             sid = self.speaker_id(name)
         return sid
+
+    def speaker_has_data(self, sid):
+        """Hlas s nahrávkami nebo tréninkem už jazyk změnit nesmí: dataset by se smíchal."""
+        recs = self.one("SELECT COUNT(*) n FROM recordings WHERE speaker_id=? "
+                        "AND status IN ('PASS','REVIEW')", (sid,))["n"]
+        runs = self.one("SELECT COUNT(*) n FROM runs WHERE speaker_id=?", (sid,))["n"]
+        return recs + runs > 0
+
+    def set_speaker_language(self, sid, language):
+        self.q("UPDATE speakers SET language=? WHERE id=?", (language, sid))
 
     def speaker_stats(self, sid):
         """(pass nahrávky, celková délka) pro mluvčího."""
@@ -174,7 +189,7 @@ class Db:
         row = self.one("SELECT MAX(id) m FROM utterances")
         return (row["m"] or 0) + 1
 
-    def add_utterance(self, text, source):
+    def add_utterance(self, text, source, language="cs"):
         text = text.strip()
         if not text:
             return None
@@ -182,15 +197,15 @@ class Db:
         if row:  # duplicity textu = stejná věta, nevytvářet znovu
             return row["id"]
         uid = self.next_utterance_id()
-        self.q("INSERT INTO utterances (id, text, source, created_at) VALUES (?,?,?,?)",
-               (uid, text, source, now()))
+        self.q("INSERT INTO utterances (id, text, source, created_at, language) "
+               "VALUES (?,?,?,?,?)", (uid, text, source, now(), language))
         return uid
 
     def utterance(self, uid):
         return self.one("SELECT * FROM utterances WHERE id = ?", (uid,))
 
     def unrecorded_utterances(self, speaker_id=None):
-        """Věty bez PASS, REVIEW ani SKIP nahrávky daného mluvčího (v pořadí ID).
+        """Věty v jazyce mluvčího bez jeho PASS, REVIEW ani SKIP nahrávky (v pořadí ID).
         REVIEW se počítá jako vyřízené — nahrávka je uložená ke kontrole,
         smyčka pokračuje další větou (uživatel překlasifikuje přes review).
         SKIP taky, jinak by přeskočená věta přišla hned znovu."""
@@ -201,10 +216,11 @@ class Db:
                 " AND r.status IN ('PASS','REVIEW','SKIP')) "
                 "ORDER BY u.id")
         return self.all(
-            "SELECT u.* FROM utterances u WHERE NOT EXISTS "
+            "SELECT u.* FROM utterances u WHERE "
+            "u.language = (SELECT language FROM speakers WHERE id = ?) AND NOT EXISTS "
             "(SELECT 1 FROM recordings r WHERE r.utterance_id = u.id "
             " AND r.status IN ('PASS','REVIEW','SKIP') AND r.speaker_id = ?) "
-            "ORDER BY u.id", (speaker_id,))
+            "ORDER BY u.id", (speaker_id, speaker_id))
 
     # ── sessions ─────────────────────────────────────────────────────────────
     def new_session_id(self):

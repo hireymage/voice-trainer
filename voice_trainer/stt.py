@@ -12,6 +12,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from voice_trainer import languages
+
 
 def normalize(text):
     """Lowercase, bez interpunkce/diakritiky-rozdílů/whitespace → srovnatelné."""
@@ -24,31 +26,18 @@ def normalize(text):
     return t
 
 
-# kmeny českých číslovek — tokeny začínající těmito kmeny (a číslice) se při
-# srovnání shovají: STT píše "12. srpna", referenční text "dvanáctého srpna",
-# a takhle by věta správně přečtená bezdůvodně FAILovala
-NUM_STEMS = (
-    "nula", "jedn", "dvě", "dvou", "dva", "tři", "tří", "čtyři", "čtyř",
-    "pět", "šest", "sedm", "osm", "devět", "deset", "jedenáct", "dvanáct",
-    "třináct", "čtrnáct", "patnáct", "šestnáct", "sedmnáct", "osmnáct",
-    "devatenáct", "dvacet", "třicet", "čtyřicet", "padesát", "šedesát",
-    "sedmdesát", "osmdesát", "devadesát", "sto", "tisíc",
-    "první", "druh", "třetí", "čtvrt", "pát", "šest", "sedm", "osm", "devát",
-    "desát",
-)
-
-
-def _no_numbers(text):
-    """Odebere tokeny, které jsou číslicí nebo číslovkou (dle kmene)."""
+def _no_numbers(text, lang):
+    """Odebere tokeny, které jsou číslicí nebo číslovkou (dle kmene nebo celého slova)."""
     out = []
     for tok in text.split():
-        if tok.isdigit() or any(tok.startswith(s) for s in NUM_STEMS):
+        if tok.isdigit() or tok in lang["number_words"] or \
+                any(tok.startswith(s) for s in lang["number_stems"]):
             continue
         out.append(tok)
     return " ".join(out)
 
 
-def similarity(reference, hypothesis):
+def similarity(reference, hypothesis, language=languages.DEFAULT_LANGUAGE, cfg=None):
     """Podíl shody 0.0–1.0 na normalizovaných textech (char-level).
     Bere se MAX ze srovnání plných textů a textů bez číselných tokenů —
     číslo zapsané slovy vs. číslicí tedy nikdy nevyvolá falešný FAIL."""
@@ -58,7 +47,8 @@ def similarity(reference, hypothesis):
     if not a or not b:
         return 0.0
     base = difflib.SequenceMatcher(None, a, b).ratio()
-    na, nb = _no_numbers(a), _no_numbers(b)
+    lang = languages.get(cfg, language)
+    na, nb = _no_numbers(a, lang), _no_numbers(b, lang)
     if not na or not nb:
         return base
     return max(base, difflib.SequenceMatcher(None, na, nb).ratio())
@@ -80,16 +70,17 @@ def cer(reference, hypothesis):
     return dist / len(a)
 
 
-def transcribe(wav_path, cfg):
+def transcribe(wav_path, cfg, language=languages.DEFAULT_LANGUAGE):
     """Pošle WAV na whisper server, vrátí (text, None). Cold-start gate může
     blokovat spojení až ~120 s — proto timeout + retry."""
+    stt_language = languages.get(cfg, language)["stt_language"]
     for attempt in range(1 + int(cfg["stt_retries"])):
         try:
             with open(wav_path, "rb") as f:
                 boundary = "----vtFormBoundary"
                 parts = []
                 for name, val in (("file", None), ("response_format", "text"),
-                                  ("language", cfg["stt_language"])):
+                                  ("language", stt_language)):
                     if val is None:  # file → multipart body níže
                         continue
                     parts.append(

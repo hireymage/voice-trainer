@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from voice_trainer import dataset as ds     # noqa: E402
 from voice_trainer import db as dbmod       # noqa: E402
+from voice_trainer import languages         # noqa: E402
 from voice_trainer import llm as llm_mod    # noqa: E402
 from voice_trainer import quality as qmod   # noqa: E402
 from voice_trainer import stt as stt_mod    # noqa: E402
@@ -45,16 +46,24 @@ def eprint(*a):
     print(*a, file=sys.stderr)
 
 
-def spawn_llm_gen(cfg):
+def spawn_llm_gen(cfg, language):
     """Detached pozadí generování vět (voice_trainer.llm_gen); flock uvnitř
     modulu chrání před duplicitním spuštěním."""
     log_path = Path(cfg["data_root"]) / "logs" / "llm-gen.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a") as lf:
         subprocess.Popen(
-            [sys.executable, "-m", "voice_trainer.llm_gen"],
+            [sys.executable, "-m", "voice_trainer.llm_gen", language],
             stdout=lf, stderr=subprocess.STDOUT,
             cwd=cfg["repo_dir"], start_new_session=True)
+
+
+def checked_language(cfg, code):
+    """Kód jazyka z argumentu; neznámý skončí čitelnou chybou."""
+    try:
+        return languages.get(cfg, code)["code"]
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
 
 
 def resolve_speaker(db, name=None):
@@ -92,9 +101,9 @@ def pick_speaker(db, args_speaker):
     return resolve_speaker(db, ans)
 
 
-def pick_base(cfg, args_base):
-    """Interaktivní výběr base modelu (label z training.bases)."""
-    bs = tr.bases(cfg)
+def pick_base(cfg, args_base, language=None):
+    """Interaktivní výběr base modelu (label z training.bases, jen v jazyce hlasu)."""
+    bs = tr.bases(cfg, language)
     if not bs:
         return None
     if args_base:
@@ -141,7 +150,8 @@ def cmd_speakers(cfg, args):
         pending = len(db.unrecorded_utterances(s["id"]))
         out.append({"id": s["id"], "name": s["name"], "passes": p,
                     "duration_s": round(d, 1), "duration_hms": _hms(d),
-                    "pending": pending,
+                    "pending": pending, "language": s["language"],
+                    "has_data": db.speaker_has_data(s["id"]),
                     "created_at": s["created_at"]})
     print(json.dumps({"speakers": out,
                       "base_models": list(bs.keys())},
@@ -151,18 +161,40 @@ def cmd_speakers(cfg, args):
 def cmd_new_speaker(cfg, args):
     """Vytvoří profil mluvčího (adresáře + DB řádek)."""
     db = get_db(cfg)
-    sid = db.ensure_speaker(args.name)
+    sid = db.ensure_speaker(args.name, checked_language(cfg, args.language))
     sp = db.speaker(sid)
     ds.wav_dir(cfg, sp["name"]).mkdir(parents=True, exist_ok=True)
     ds.master_dir(cfg, sp["name"]).mkdir(parents=True, exist_ok=True)
     eprint(f"✓ mluvčí '{sp['name']}' (id {sid}) připraven")
-    print(json.dumps({"id": sid, "name": sp["name"]}, ensure_ascii=False))
+    print(json.dumps({"id": sid, "name": sp["name"], "language": sp["language"]},
+                     ensure_ascii=False))
+
+
+def cmd_speaker_language(cfg, args):
+    """Změní jazyk hlasu; jde jen dokud hlas nemá nahrávky ani trénink."""
+    db = get_db(cfg)
+    sid = resolve_speaker(db, args.name)
+    language = checked_language(cfg, args.language)
+    if db.speaker(sid)["language"] != language and db.speaker_has_data(sid):
+        raise SystemExit(f"hlas {args.name} už má nahrávky, jazyk nejde změnit; "
+                         "pro jiný jazyk vytvoř nový hlas")
+    db.set_speaker_language(sid, language)
+    print(json.dumps({"name": args.name, "language": language}, ensure_ascii=False))
+
+
+def cmd_languages(cfg, args):
+    """Dostupné jazyky (JSON). has_base = na serveru je pro ně základní model k tréninku."""
+    out = [{"code": lang["code"], "name": lang["name"],
+            "has_base": bool(tr.bases(cfg, lang["code"]))}
+           for lang in languages.available(cfg).values()]
+    print(json.dumps({"languages": out}, ensure_ascii=False))
 
 
 def cmd_import_text(cfg, args):
     setup_logging(cfg, "recording")
     db = get_db(cfg)
     path = Path(args.file)
+    language = checked_language(cfg, args.language)
     text = path.read_text(encoding="utf-8-sig")
     added, skipped = 0, 0
     for line in text.splitlines():
@@ -173,7 +205,7 @@ def cmd_import_text(cfg, args):
         if "|" in line:
             parts = line.split("|", 1)
             line = parts[1].strip() if len(parts) > 1 else parts[0].strip()
-        uid = db.add_utterance(line, "import")
+        uid = db.add_utterance(line, "import", language)
         if uid and db.utterance(uid)["created_at"]:
             skipped += 1 if False else 0  # dedup je v add_utterance
         skipped += 0
@@ -189,11 +221,12 @@ def cmd_generate(cfg, args):
     setup_logging(cfg, "system")
     db = get_db(cfg)
     count = args.count or int(cfg["llm_batch_size"])
-    eprint(f"» generuji {count} vět ({cfg['llm_model']} @ {cfg['llm_url']})…")
-    sentences = llm_mod.generate(cfg, count)
+    language = checked_language(cfg, args.language)
+    eprint(f"» generuji {count} vět, jazyk {language} ({cfg['llm_model']} @ {cfg['llm_url']})…")
+    sentences = llm_mod.generate(cfg, count, language)
     added = 0
     for s in sentences:
-        db.add_utterance(s, "llm")
+        db.add_utterance(s, "llm", language)
         added += 1
     total = db.one("SELECT COUNT(*) n FROM utterances")["n"]
     eprint(f"✓ vygenerováno {added} vět (dataset má {total})")
@@ -305,9 +338,10 @@ def cmd_next_sentence(cfg, args):
     # další věta: první bez PASS pro tohoto mluvčího; když zbyvá málo →
     # předgenerovat na pozadí (LLM občas generuje i minuty — hranice dávky
     # nesmí zastavit nahrávání)
+    language = db.speaker(speaker_id)["language"]
     pending = db.unrecorded_utterances(speaker_id)
     if len(pending) <= 3:
-        spawn_llm_gen(cfg)
+        spawn_llm_gen(cfg, language)
     if not pending:
         eprint("» čekám na nové věty (generuji na pozadí)…")
         deadline = datetime.datetime.now() + datetime.timedelta(seconds=600)
@@ -324,6 +358,7 @@ def cmd_next_sentence(cfg, args):
         "session": sid,
         "session_status": sess["status"],
         "speaker": speaker_name,
+        "language": language,
         "utterance_id": utt["id"],
         "text": utt["text"],
         "session_pass_count": pass_count,
@@ -427,9 +462,10 @@ def cmd_check(cfg, args):
     if not path.exists():
         raise SystemExit(f"wav nenalezeno: {path}")
     eprint(f"» STT {path} …")
-    text = stt_mod.transcribe(path, cfg)
     utt = db.utterance(rec["utterance_id"])
-    sim = stt_mod.similarity(utt["text"], text) if utt else None
+    language = utt["language"] if utt else languages.DEFAULT_LANGUAGE
+    text = stt_mod.transcribe(path, cfg, language)
+    sim = stt_mod.similarity(utt["text"], text, language, cfg) if utt else None
     db.q("UPDATE recordings SET stt_text=?, similarity=?, checked_at=? WHERE id=?",
          (text, sim, dbmod.now(), rec["id"]))
     issues, ok = qmod.check_recording(db, cfg, dict(rec))
@@ -502,7 +538,7 @@ def cmd_train(cfg, args):
         raise SystemExit("trénink už běží (pgrep piper.train) — voice-trainer status")
     _confirm_gpu(cfg, args.yes)
     speaker_id = pick_speaker(db, args.speaker)
-    base_name = pick_base(cfg, args.base)
+    base_name = pick_base(cfg, args.base, db.speaker(speaker_id)["language"])
     info = tr.start_training(db, cfg, base_ckpt=args.checkpoint,
                              max_epochs=args.epochs, run_name=args.run,
                              speaker_id=speaker_id, base_name=base_name)
@@ -679,7 +715,7 @@ def cmd_api(cfg, args):
 def main():
     parser = argparse.ArgumentParser(
         prog="voice-trainer",
-        description="Trénink vlastního českého Piper hlasu")
+        description="Trénink vlastního Piper hlasu")
     parser.add_argument("--config", help="cesta ke config.yaml")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -687,10 +723,17 @@ def main():
     sub.add_parser("speakers", help="seznam mluvčích (JSON)")
     p = sub.add_parser("new-speaker", help="vytvořit profil mluvčího")
     p.add_argument("--name", required=True)
+    p.add_argument("--language", default=languages.DEFAULT_LANGUAGE)
+    p = sub.add_parser("speaker-language", help="změnit jazyk hlasu bez nahrávek")
+    p.add_argument("--name", required=True)
+    p.add_argument("--language", required=True)
+    sub.add_parser("languages", help="dostupné jazyky (JSON)")
     p = sub.add_parser("import-text", help="import TXT/CSV vět (id|text nebo čisté řádky)")
     p.add_argument("--file", required=True)
+    p.add_argument("--language", default=languages.DEFAULT_LANGUAGE)
     p = sub.add_parser("generate", help="vygenerovat vět LLM (ollama)")
     p.add_argument("--count", type=int, default=None)
+    p.add_argument("--language", default=languages.DEFAULT_LANGUAGE)
     sub.add_parser("dataset", help="info o datasetu (JSON)")
     p = sub.add_parser("next-sentence", help="[protokol] další věta k nahrání (JSON)")
     p.add_argument("--session", default=None, help="pokračovat v konkrétní session")
@@ -752,6 +795,7 @@ def main():
     handlers = {
         "init": cmd_init, "speakers": cmd_speakers,
         "new-speaker": cmd_new_speaker,
+        "speaker-language": cmd_speaker_language, "languages": cmd_languages,
         "import-text": cmd_import_text,
         "generate": cmd_generate, "dataset": cmd_dataset,
         "next-sentence": cmd_next_sentence, "save": cmd_save,

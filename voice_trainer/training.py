@@ -16,6 +16,7 @@ from pathlib import Path
 
 from voice_trainer import dataset as ds
 from voice_trainer import db as dbmod
+from voice_trainer import languages
 
 
 def gpu_status():
@@ -84,19 +85,23 @@ def training_running(cfg, exclude_pid=None):
     return False
 
 
-def bases(cfg):
-    """Dostupné base modely: dict label → {ckpt, config}.
-    Config definuje training.bases (mapa label → cesty); pokud chybí,
+def bases(cfg, language=None):
+    """Dostupné base modely: dict label → {ckpt, config, language}, případně jen pro jeden jazyk.
+    Config definuje training.bases (mapa label → cesty a language, výchozí cs); pokud chybí,
     fallback z legacy klíčů base_checkpoint/base_config pod label 'jirka'."""
     t = cfg["training"]
     out = {}
     for label, b in (t.get("bases") or {}).items():
         if isinstance(b, dict):
             out[label] = {"ckpt": b.get("checkpoint") or "",
-                          "config": b.get("config") or ""}
+                          "config": b.get("config") or "",
+                          "language": b.get("language") or languages.DEFAULT_LANGUAGE}
     if not out and t.get("base_checkpoint"):
         out["jirka"] = {"ckpt": t["base_checkpoint"],
-                        "config": t.get("base_config") or ""}
+                        "config": t.get("base_config") or "",
+                        "language": languages.DEFAULT_LANGUAGE}
+    if language is not None:
+        out = {label: b for label, b in out.items() if b["language"] == language}
     return out
 
 
@@ -112,7 +117,7 @@ def resolve_base(cfg, base_name=None):
 
 
 def build_fit_cmd(cfg, run_dir, sample_rate, base_ckpt, max_epochs,
-                  voice_name="voice-trainer"):
+                  voice_name="voice-trainer", espeak_voice=None):
     """LightningCLI fit příkaz (piper venv) — argumenty dle TRAINING.md."""
     t = cfg["training"]
     py = str(Path(t["piper_venv"]) / "bin" / "python")
@@ -129,7 +134,7 @@ def build_fit_cmd(cfg, run_dir, sample_rate, base_ckpt, max_epochs,
         "--data.audio_dir", str(Path(run_dir) / "audio"),
         "--data.cache_dir", str(Path(run_dir) / "cache"),
         "--data.config_path", str(Path(run_dir) / "config.json"),
-        "--data.espeak_voice", str(t["espeak_voice"]),
+        "--data.espeak_voice", str(espeak_voice or t["espeak_voice"]),
         "--data.batch_size", str(t["batch_size"]),
         "--data.validation_split", str(t["val_ratio"]),
         "--data.num_test_examples", "2",
@@ -167,9 +172,18 @@ def start_training(db, cfg, base_ckpt=None, max_epochs=None, run_name=None,
     sp = db.speaker(speaker_id)
     if sp is None:
         raise SystemExit("neznámý mluvčí")
+    language = sp["language"]
+    # základ v jiném jazyce by hlas naučil špatnou výslovnost
+    allowed = bases(cfg, language)
+    if not base_ckpt and base_name is None and bases(cfg) and not allowed:
+        raise SystemExit(f"pro jazyk {language} není základní model; "
+                         "přidej ho do training.bases v config.yaml")
+    if base_name is not None and bases(cfg).get(base_name) and base_name not in allowed:
+        raise SystemExit(f"base model {base_name} není pro jazyk {language}")
     if base_name is None and not base_ckpt:
-        bs = bases(cfg)
-        base_name = next(iter(bs)) if bs else None
+        base_name = next(iter(allowed)) if allowed else None
+    # bez labelu (vlastní --checkpoint) se česká větev dál řetězí pod původním jménem
+    base_label = base_name or ("jirka" if language == languages.DEFAULT_LANGUAGE else "custom")
     ckpt_label, base_config = resolve_base(cfg, base_name)
     if base_name is not None and ckpt_label is None:
         raise SystemExit(f"neznámý base model: {base_name} (config training.bases)")
@@ -184,13 +198,13 @@ def start_training(db, cfg, base_ckpt=None, max_epochs=None, run_name=None,
     run_dir = ds.training_root(cfg) / name
     run_dir.mkdir(parents=True, exist_ok=True)
     run = db.create_run(name, str(run_dir), base, speaker_id=speaker_id,
-                        base_name=base_name or "jirka")
+                        base_name=base_label)
     if defer:
         db.update_run(run["id"], "queued", notes="čeká na uvolnění GPU")
     payload = {
         "run_id": run["id"], "run_name": name, "run_dir": str(run_dir),
         "base_checkpoint": base, "base_config": base_config or "",
-        "base_name": base_name or "jirka",
+        "base_name": base_label,
         "speaker_id": speaker_id, "speaker_name": sp["name"],
         "sample_rate": sr,
         "max_epochs": max_epochs or int(t["max_epochs"]),
@@ -199,7 +213,8 @@ def start_training(db, cfg, base_ckpt=None, max_epochs=None, run_name=None,
         "piper_venv": t["piper_venv"], "piper_repo": t["piper_repo"],
         "batch_size": t["batch_size"], "devices": t["devices"],
         "strategy": t["strategy"], "precision": t["precision"],
-        "espeak_voice": t["espeak_voice"], "val_ratio": t["val_ratio"],
+        "espeak_voice": languages.get(cfg, language)["espeak_voice"],
+        "val_ratio": t["val_ratio"],
         "recording": cfg["recording"],
         "quality": cfg["quality"],
     }
@@ -213,7 +228,7 @@ def start_training(db, cfg, base_ckpt=None, max_epochs=None, run_name=None,
         cwd=cfg["repo_dir"], start_new_session=True)
     return {"run": name, "run_dir": str(run_dir), "samples": passes,
             "duration_s": round(dur, 1), "sample_rate": sr, "base": base,
-            "base_name": base_name or "jirka", "speaker": sp["name"],
+            "base_name": base_label, "speaker": sp["name"],
             "queued": defer}
 
 

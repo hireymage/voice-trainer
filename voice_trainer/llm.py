@@ -4,41 +4,19 @@ import random
 import re
 import urllib.request
 
-# témata se losují na každou dávku — jinak model krouží pořád dokola kolem
-# počasí/dopravy/nákupu (TTS dataset potřebuje hlavně fonetickou rozmanitost)
-TOPICS = [
-    "vaření a kuchyně", "domácí mazlíčci", "sport a cvičení", "cestování",
-    "práce a kancelář", "zahrada a rostliny", "auta a doprava", "hudba",
-    "knihy a čtení", "děti a škola", "nákup a peníze", "počasí a roční období",
-    "zdraví a lékař", "technika a počítače", "filmy a seriály", "zahrádka",
-    "rybaření a myslivost", "historie a památky", "kávovary a káva",
-    "pronájmy a bydlení", "úklid a pořádek", "nástěnné hodiny a čas",
-    "fakturace a účty", "zahraniční výlety", "cyklistika", "vlaky a stanice",
-    "restaurace a jídlo venku", "nakupování online", "úklid bytu",
-    "zimní sporty", "zahrada na jaře", "přátelé a rodina", "spánek a ranní rutina",
-    "účetnictví a daně", "knihovna a čtení", "kino a divadlo",
-]
+from voice_trainer import languages
 
-PROMPT = (
-    "Vygeneruj {count} krátkých českých vět pro nahrávání hlasového datasetu "
-    "(TTS). Pravidla: přirozené běžné věty, 5 až 15 slov. TÉMATA PRO TENTO "
-    "BATCH (střídej je mezi větami): {topics}. VĚTA NESMÍ OBSAHOVAT ČÍSLA, "
-    "data ani roky — piš je slovy nebo je vynech (STT je pak píše číslicemi "
-    "a kontrola shody nesedí). Každá věta na vlastní řádek ve formátu: "
-    "NNN|věta. Žádný jiný text, žádné úvozovky."
-)
-
-
-def generate(cfg, count=None):
-    """Vrátí seznam {count} českých vět (čistý text, bez číslování)."""
+def generate(cfg, count=None, language=languages.DEFAULT_LANGUAGE):
+    """Vrátí seznam {count} vět v daném jazyce (čistý text, bez číslování)."""
     count = int(count or cfg["llm_batch_size"])
+    lang = languages.get(cfg, language)
     # náhodný výběr témat → každá dávka míří jinam (jinak model krouží)
-    topics = random.sample(TOPICS, min(6, len(TOPICS)))
+    topics = random.sample(lang["topics"], min(6, len(lang["topics"])))
     payload = {
         "model": cfg["llm_model"],
         "messages": [{"role": "user",
-                      "content": PROMPT.format(count=count,
-                                               topics=", ".join(topics))}],
+                      "content": lang["prompt"].format(count=count, language=lang["english_name"],
+                                                       topics=", ".join(topics))}],
         "stream": False,
         "options": {"temperature": 0.9},
     }
