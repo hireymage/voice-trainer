@@ -44,6 +44,7 @@ training:
   # sample_rate se čte z base checkpoint configu; fallback pro první ukládání:
   fallback_sample_rate: 22050
   highpass_hz: 80         # filtr hučení pozadí při přípravě dat; master zůstává surový (0 = vypnuto)
+  speech_level_db: -23    # hlasitost řeči v kopii pro trénink, stálé zesílení na nahrávku (0 = vypnuto)
   espeak_voice: cs
   devices: 2              # 2× GTX 1080 Ti (DDP)
   strategy: ddp
@@ -80,5 +81,5 @@ quality:
   max_duration: 30.0      # s
   clip_peak: 0.99
   clip_count: 20          # počet sampleů >= clip_peak → REVIEW
-  quiet_rms_db: -35.0
+  quiet_rms_db: -60.0     # surová nahrávka; mikrofon bez zpracování je tichý a zesílí se až pro trénink
   loud_rms_db: -10.0

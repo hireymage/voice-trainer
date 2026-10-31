@@ -4,9 +4,19 @@ Profily mluvčích (2026-09-26): WAV cesty jsou dataset/wav/<mluvčí>/NNNNNN.wa
 (stejná věta nahráná dvěma mluvčími = dva soubory, žádná kolize názvů).
 """
 import json
+import math
 import shutil
 import subprocess
+import wave
 from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:  # bez numpy se hlasitost nesrovnává
+    np = None
+
+PEAK_LIMIT_DB = -1.0
+MAX_GAIN_DB = 40.0
 
 
 def wav_dir(cfg, speaker=None):
@@ -99,15 +109,44 @@ def check_wav(path):
         return None
 
 
-def ensure_format(path, sample_rate, highpass_hz=0):
+def speech_gain_db(path, target_db):
+    """Stálé zesílení pro jednu nahrávku, aby řeč měla hlasitost target_db. Měří se jen řeč,
+    ticho na začátku a konci by výsledek snížilo. Bez dynamické komprese, špičky nepřebudí.
+    Mikrofon bez zpracování (iPhone v režimu measurement) dává řeč kolem -45 dB."""
+    if np is None or not target_db:
+        return 0.0
+    with wave.open(str(path), "rb") as w:
+        if w.getsampwidth() != 2:
+            return 0.0
+        channels = w.getnchannels()
+        rate = w.getframerate()
+        samples = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64) / 32768.0
+    samples = samples[::channels]
+    size = int(rate * 0.05)
+    if samples.size < size:
+        return 0.0
+    windows = samples[:samples.size // size * size].reshape(-1, size)
+    energy = np.maximum(np.mean(windows ** 2, axis=1), 1e-12)
+    levels = 10 * np.log10(energy)
+    speech = energy[levels > np.percentile(levels, 10) + 15]
+    peak = float(np.max(np.abs(samples)))
+    if speech.size == 0 or peak == 0:
+        return 0.0
+    level = 10 * math.log10(float(np.mean(speech)))
+    headroom = PEAK_LIMIT_DB - 20 * math.log10(peak)
+    return max(0.0, min(target_db - level, headroom, MAX_GAIN_DB))
+
+
+def ensure_format(path, sample_rate, highpass_hz=0, gain_db=0.0):
     """Konverze na mono/PCM16/sample_rate (in-place přes tmp + atomic rename).
-    highpass_hz > 0 odřízne hučení pozadí pod touto frekvencí (strmě, dvakrát za sebou)."""
+    highpass_hz > 0 odřízne hučení pozadí pod touto frekvencí (strmě, dvakrát za sebou).
+    gain_db je stálé zesílení celé nahrávky."""
     path = Path(path)
     info = check_wav(path)
     if info is None:
         return None
     sr, ch, _ = info
-    if not highpass_hz and sr == sample_rate and ch == 1:
+    if not highpass_hz and not gain_db and sr == sample_rate and ch == 1:
         # sjednotit i na PCM16 (whisper/master mohly mít jiný formát)
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
@@ -117,8 +156,10 @@ def ensure_format(path, sample_rate, highpass_hz=0):
         if codec == "pcm_s16le":
             return info
     tmp = path.with_suffix(".tmp.wav")
-    af = (["-af", f"highpass=f={highpass_hz},highpass=f={highpass_hz}"]
-          if highpass_hz else [])
+    filters = [f"highpass=f={highpass_hz},highpass=f={highpass_hz}"] if highpass_hz else []
+    if gain_db:
+        filters.append(f"volume={gain_db:.2f}dB")
+    af = ["-af", ",".join(filters)] if filters else []
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), *af,
          "-ar", str(sample_rate), "-ac", "1", "-c:a", "pcm_s16le", str(tmp)],
@@ -146,7 +187,9 @@ def build_training_dataset(db, cfg, run_name, speaker_id=None, sample_rate=None)
             dst = audio_dir / utterance_name(rec["utterance_id"])
             if not dst.exists():
                 shutil.copy2(src, dst)
-                ensure_format(dst, sr, cfg["training"]["highpass_hz"])
+                # zdroj zůstává surový, hlasitost se srovná až v kopii pro trénink
+                gain = speech_gain_db(src, cfg["training"].get("speech_level_db"))
+                ensure_format(dst, sr, cfg["training"]["highpass_hz"], gain)
             count += 1
             total_dur += rec["duration"] or 0.0
     # metadata.csv (bez duplicity textu, Piper formát)

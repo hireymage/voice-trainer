@@ -28,6 +28,7 @@ _DEFAULTS = {
     "training": {
         "fallback_sample_rate": 22050,
         "highpass_hz": 80,
+        "speech_level_db": -23,
         "espeak_voice": "cs",
         "devices": 2,
         "strategy": "ddp",
@@ -51,7 +52,7 @@ _DEFAULTS = {
         "max_duration": 30.0,
         "clip_peak": 0.99,
         "clip_count": 20,
-        "quiet_rms_db": -35.0,
+        "quiet_rms_db": -60.0,
         "loud_rms_db": -10.0,
     },
 }
