@@ -127,3 +127,10 @@ build cu118 (`torch.cuda.get_device_name(0)`) a DDP s `NCCL_P2P_DISABLE=1`.
 **Trénink selže hned:** chybí `espeak-ng` (apt), nebo Lightning checkpoint
 gotchy (medium quality jen; případně clean_checkpoint fix z
 OHF-Voice/piper1-gpl#132) — viz `training/run_XXX/training.log`.
+
+## Licence
+
+Kód v tomto repozitáři je pod licencí [MIT](LICENSE). Piper (piper1-gpl) tu není přibalený,
+instaluje se zvlášť a platí pro něj jeho vlastní licence GPL. `voice_trainer/piper_fit.py`
+a `voice_trainer/clean_ckpt.py` ho za běhu importují, takže kdo šíří celek i s Piperem,
+musí pro něj dodržet podmínky GPL.
