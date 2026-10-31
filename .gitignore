@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# skutečné nastavení stroje; vzor je config.example.yaml
+/config.yaml
+
+# klienti mají vlastní soukromý repozitář
+/app/
+/client/

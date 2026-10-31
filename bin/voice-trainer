@@ -1,0 +1,4 @@
+#!/bin/bash
+# voice-trainer — wrapper na repo venv (jiné umístění: VOICE_TRAINER_VENV)
+cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
+exec "${VOICE_TRAINER_VENV:-/mnt/models/voice-trainer/venv}/bin/python" -m voice_trainer.cli "$@"

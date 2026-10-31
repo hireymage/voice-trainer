@@ -1,0 +1,13 @@
+# API pro klientské aplikace (systemd --user). Instalace v README.
+[Unit]
+Description=voice-trainer API pro iOS aplikaci
+# ZeroTier adresa nemusí být po startu hned k dispozici, proto opakované spouštění
+After=network-online.target
+
+[Service]
+ExecStart=%h/voice-trainer/bin/voice-trainer api
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
