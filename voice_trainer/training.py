@@ -153,16 +153,30 @@ def _read_json(path):
         return {}
 
 
-def _fit_epoch(run_dir):
-    """Poslední epocha z logu Lightningu; log je dlouhý, čte se jen konec."""
+def _fit_log_last(run_dir, pattern):
+    """Poslední výskyt čísla v logu Lightningu; log je dlouhý, čte se jen konec."""
     try:
         with open(Path(run_dir) / "fit.log", "rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 65536))
-            found = re.findall(rb"Epoch (\d+)", f.read())
+            found = re.findall(pattern, f.read())
     except OSError:
         return None
-    return int(found[-1]) if found else None
+    return found[-1] if found else None
+
+
+def _fit_epoch(run_dir):
+    found = _fit_log_last(run_dir, rb"Epoch (\d+)")
+    return int(found) if found is not None else None
+
+
+def run_quality(run):
+    """(poslední, nejlepší) val_mos runu: odhad kvality 1–5, vyšší je lepší. Bez prediktoru MOS None."""
+    run_dir = Path(run["dataset_dir"])
+    latest = _fit_log_last(run_dir, rb"val_mos=(\d+\.\d+)")
+    saved = [float(m.group(1)) for p in run_dir.rglob("epoch=*-val_mos=*.ckpt")
+             if (m := re.search(r"val_mos=(\d+\.\d+)", p.name))]
+    return float(latest) if latest is not None else None, max(saved, default=None)
 
 
 def progress(db, cfg, speaker_id):

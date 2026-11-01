@@ -301,8 +301,12 @@ def speaker_id_of(db, name):
 def training_status(cfg, db, name):
     sid = speaker_id_of(db, name)
     speaker = db.speaker(sid)
-    ckpt, _ = tr.trained_checkpoint(db, sid)
+    # číslo patří k runu zkoušeného stavu, ne nutně k poslednímu runu
+    ckpt, ckpt_run = tr.trained_checkpoint(db, sid)
+    quality, best_quality = tr.run_quality(ckpt_run) if ckpt_run is not None else (None, None)
     return {**tr.progress(db, cfg, sid),
+            "quality": quality,
+            "best_quality": best_quality,
             "gpu_busy": tr.training_running(cfg),
             "busy_speaker": tr.busy_speaker(db, sid),
             "can_test": ckpt is not None,

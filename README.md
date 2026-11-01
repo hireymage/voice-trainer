@@ -127,7 +127,8 @@ voice-trainer test --model export/xxx.onnx --text "Moje testovací věta."
 Výstup: `export/<jméno>-medium.onnx` + `.onnx.json` — hotový Piper model.
 
 Z klienta: `POST /training/test` vrátí větu namluvenou posledním uloženým stavem hlasu, i během tréninku.
-Model pro tenhle účel je v `export/app/` a syntéza běží na serveru bez GPU.
+Model pro tenhle účel je v `export/app/` a syntéza běží na serveru bez GPU. `GET /training` k němu
+vrací `quality` a `best_quality`: poslední a nejlepší `val_mos` runu, odhad kvality 1–5, vyšší je lepší.
 
 Kam se hotový model nasazuje, je věc konkrétní instalace. `POST /training/publish` proto jen
 spustí `publish_command` z `config.yaml`, například:
