@@ -8,9 +8,15 @@ Klíčové invarianty:
 - Profily (2026-09-26): run patří dvojici (mluvčí × base model); každá dvojice
   má vlastní checkpoint chain — stejná data se dají trénovat z různých bazí.
 """
+import datetime
 import json
+import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -51,17 +57,34 @@ def stop_lanes(cfg):
     return stopped
 
 
+def restart_lanes(cfg, run_dir):
+    """Znovu spustí služby z gpu_restart_units, které tenhle run zastavil. Načítání modelu
+    může trvat minuty, proto se na výsledek nečeká."""
+    stopped = _read_json(Path(run_dir) / "stopped_units.json")
+    units = [u for u in (stopped if isinstance(stopped, list) else [])
+             if u in (cfg.get("gpu_restart_units") or [])]
+    for unit in units:
+        subprocess.Popen(["sudo", "-n", "systemctl", "start", unit],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    return units
+
+
 def lane_states(cfg):
     return {u: subprocess.run(["systemctl", "is-active", u], capture_output=True,
                               timeout=15).stdout.decode().strip()
             for u in cfg["gpu_lane_units"]}
 
 
-def training_running(cfg, exclude_pid=None):
-    """Běží nějaký piper fit / runner? Čte /proc přímo a filtruje na
-    python procesy — pgrep -f by matchoval i bash wrappery, které mají
+def _training_pids(exclude_pid=None, run_dir=None):
+    """Procesy tréninku; s run_dir jen toho runu včetně čekání ve frontě. Čte /proc přímo a
+    filtruje na python procesy — pgrep -f by matchoval i bash wrappery, které mají
     'piper_fit' jen ve vlastním příkazu (monitoring, ssh -c ...)."""
     import errno
+    pids = []
+    markers = ["voice_trainer.piper_fit", "piper.train", "voice_trainer.trainer_runner"]
+    if run_dir is not None:
+        markers.append("voice_trainer.train_queue")
     for pdir in Path("/proc").iterdir():
         if not pdir.name.isdigit():
             continue
@@ -78,11 +101,118 @@ def training_running(cfg, exclude_pid=None):
             if e.errno in (errno.ENOENT, errno.ESRCH, errno.EACCES):
                 continue
             raise
-        if ("voice_trainer.piper_fit" in cmdline
-                or "piper.train" in cmdline
-                or "voice_trainer.trainer_runner" in cmdline):
-            return True
-    return False
+        # export ONNX je taky piper.train, ale GPU nezabírá
+        if "export_onnx" in cmdline or not any(m in cmdline for m in markers):
+            continue
+        if run_dir is None or f"{run_dir}/" in cmdline:
+            pids.append(pid)
+    return pids
+
+
+def training_running(cfg, exclude_pid=None):
+    """Běží nějaký piper fit / runner?"""
+    return bool(_training_pids(exclude_pid))
+
+
+def run_alive(run):
+    return bool(_training_pids(run_dir=run["dataset_dir"]))
+
+
+def stop_run(db, cfg, run, wait_s=30):
+    """Zastaví daný run. Procesy se hledají podle složky runu, takže to nesáhne na jiný
+    trénink. Uložený last.ckpt zůstává a další run na něj naváže."""
+    run_dir = run["dataset_dir"]
+
+    def send(sig):
+        pids = _training_pids(run_dir=run_dir)
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        return pids
+
+    send(signal.SIGTERM)
+    deadline = time.time() + wait_s
+    while _training_pids(run_dir=run_dir) and time.time() < deadline:
+        time.sleep(1)
+    if send(signal.SIGKILL):
+        time.sleep(2)  # GPU se uvolní až po skutečném konci procesů
+    db.update_run(run["id"], "stopped", notes="zastaveno")
+    status_path = Path(run_dir) / "status.json"
+    status = _read_json(status_path)
+    status.update(status="stopped", updated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    status_path.write_text(json.dumps(status, indent=2))
+    return restart_lanes(cfg, run_dir)
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _fit_epoch(run_dir):
+    """Poslední epocha z logu Lightningu; log je dlouhý, čte se jen konec."""
+    try:
+        with open(Path(run_dir) / "fit.log", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            found = re.findall(rb"Epoch (\d+)", f.read())
+    except OSError:
+        return None
+    return int(found[-1]) if found else None
+
+
+def progress(db, cfg, speaker_id):
+    """Stav posledního runu hlasu pro klienta: state, procenta a odhad zbývajícího času."""
+    passes, _ = db.stats(speaker_id)
+    out = {"state": "idle", "run": None, "percent": None, "epoch_done": None,
+           "epoch_total": None, "eta_s": None, "samples": None, "new_recordings": 0,
+           "passes": passes, "error": None, "ended_at": None}
+    run = db.latest_run(speaker_id=speaker_id)
+    if run is None:
+        return out
+    run_dir = Path(run["dataset_dir"])
+    status = _read_json(run_dir / "status.json")
+    state = run["status"]
+    alive = run_alive(run)
+    if state == "running":
+        state = (status.get("status") or "preparing") if alive else "failed"
+    if state == "failed":
+        # runner po pádu řádek v DB nestihl přepsat
+        out["error"] = status.get("reason") or run["notes"] or "trénink se nečekaně ukončil"
+    samples = (status.get("dataset") or {}).get("count")
+    out.update(state=state, run=run["name"], samples=samples, ended_at=run["ended_at"],
+               new_recordings=max(0, passes - samples) if samples is not None else 0)
+
+    # Lightning čísluje epochy dál od základu: první je base+1, poslední base+max_epochs-1
+    max_epochs = int(_read_json(run_dir / "train_request.json").get("max_epochs") or 0)
+    if max_epochs < 2:
+        return out
+    meta_path = run_dir / "base_meta.json"
+    base_epoch = int(_read_json(meta_path).get("epoch") or 0)
+    total = max_epochs - 1
+    epoch = _fit_epoch(run_dir)
+    done = total if state == "done" else \
+        min(total, max(0, epoch - base_epoch - 1)) if epoch is not None else 0
+    out.update(epoch_done=done, epoch_total=total, percent=round(done / total * 100, 1))
+    if state == "training" and done >= 3 and meta_path.exists():
+        # base_meta.json vzniká těsně před fitem, měří se tedy i příprava keše
+        elapsed = time.time() - meta_path.stat().st_mtime
+        out["eta_s"] = int(elapsed / done * (total - done))
+    return out
+
+
+def busy_speaker(db, speaker_id):
+    """Jméno jiného hlasu, který právě trénuje (GPU jsou jen jedny)."""
+    for run in db.all("SELECT r.*, s.name sp_name FROM runs r JOIN speakers s "
+                      "ON s.id = r.speaker_id WHERE r.status IN ('running','queued') "
+                      "AND r.speaker_id <> ?", (speaker_id,)):
+        if run_alive(run):
+            return run["sp_name"]
+    return None
 
 
 def bases(cfg, language=None):
@@ -238,7 +368,7 @@ def find_checkpoint(db, cfg, which="last", speaker_id=None, base_name=None):
     zastavený run zablokuje řetězení). Dvojice (speaker × base) = nezávislé
     řetězce; NULL sloupce (legacy) matchnou jen NULL query — po migraci
     jsou ale všechny runy backfillnuté."""
-    sql = ("SELECT * FROM runs WHERE status IN ('done','running')")
+    sql = ("SELECT * FROM runs WHERE status IN ('done','running','stopped')")
     args = []
     if speaker_id is not None:
         sql += " AND speaker_id = ?"
@@ -267,20 +397,104 @@ def find_checkpoint(db, cfg, which="last", speaker_id=None, base_name=None):
     return str(best[-1]) if best else None
 
 
+def _run_piper(cmd, timeout):
+    # bez GPU: export i zkouška musí jít i při běžícím tréninku
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                          env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+    if proc.returncode != 0:
+        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else f"{cmd[2]} selhal")
+
+
 def export_onnx(cfg, checkpoint, output_file):
     """piper.train.export_onnx → .onnx + .onnx.json (config z run dir)."""
     t = cfg["training"]
     py = str(Path(t["piper_venv"]) / "bin" / "python")
-    cmd = [py, "-m", "piper.train.export_onnx", "--checkpoint", checkpoint,
-           "--output-file", output_file]
-    subprocess.run(cmd, check=True, timeout=1800)
+    _run_piper([py, "-m", "piper.train.export_onnx", "--checkpoint", checkpoint,
+                "--output-file", output_file], 1800)
     return output_file
+
+
+def trained_checkpoint(db, speaker_id):
+    """Poslední uložený stav hlasu a jeho run. base.ckpt se nepočítá, ten by zněl cizím hlasem."""
+    for run in db.all("SELECT * FROM runs WHERE speaker_id=? AND status IN "
+                      "('done','running','stopped') ORDER BY id DESC", (speaker_id,)):
+        found = sorted(Path(run["dataset_dir"]).rglob("last.ckpt"),
+                       key=lambda p: p.stat().st_mtime)
+        if found:
+            return found[-1], run
+    return None, None
+
+
+def _model_paths(cfg, speaker_name):
+    outdir = Path(cfg["data_root"]) / "export" / "app"
+    onnx = outdir / f"{speaker_name}.onnx"
+    return outdir, onnx, Path(f"{onnx}.json"), outdir / f"{speaker_name}.source"
+
+
+def app_model(db, cfg, speaker_id):
+    """Model z posledního stavu hlasu pro zkoušku a nasazení: (onnx, config, run), nebo None.
+    Stejný stav se znovu neexportuje a exporty z CLI to nepřepisuje."""
+    ckpt, run = trained_checkpoint(db, speaker_id)
+    if ckpt is None:
+        return None
+    outdir, onnx, config, source = _model_paths(cfg, db.speaker(speaker_id)["name"])
+    outdir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=outdir) as tmp:
+        # během tréninku se last.ckpt přepisuje; kopie musí být z jednoho stavu
+        copy = Path(tmp) / "model.ckpt"
+        for _ in range(5):
+            stamp = ckpt.stat().st_mtime_ns
+            key = f"{ckpt}:{stamp}"
+            if onnx.exists() and config.exists() and source.exists() \
+                    and source.read_text() == key:
+                return onnx, config, run
+            shutil.copy2(ckpt, copy)
+            if ckpt.stat().st_mtime_ns == stamp:
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError("checkpoint se pořád přepisuje, zkus to za chvíli")
+        new = Path(tmp) / "model.onnx"
+        export_onnx(cfg, str(copy), str(new))
+        new.replace(onnx)
+        shutil.copy2(Path(run["dataset_dir"]) / "config.json", config)
+        source.write_text(key)
+    return onnx, config, run
+
+
+def published_at(cfg, speaker_name):
+    """Kdy se model hlasu naposledy nasadil přes publish_command."""
+    outdir, _, _, _ = _model_paths(cfg, speaker_name)
+    try:
+        stamp = (outdir / f"{speaker_name}.published").stat().st_mtime
+    except OSError:
+        return None
+    return datetime.datetime.fromtimestamp(stamp).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def publish_model(db, cfg, speaker_id):
+    """Spustí publish_command z configu; kam se model nasazuje, ví jen ten příkaz.
+    None, když hlas ještě nemá co nasadit."""
+    model = app_model(db, cfg, speaker_id)
+    if model is None:
+        return None
+    onnx, config, run = model
+    sp = db.speaker(speaker_id)
+    proc = subprocess.run(
+        cfg["publish_command"], shell=True, capture_output=True, timeout=600, cwd=cfg["repo_dir"],
+        env={**os.environ, "VT_MODEL": str(onnx), "VT_MODEL_CONFIG": str(config),
+             "VT_SPEAKER": sp["name"], "VT_LANGUAGE": sp["language"], "VT_RUN": run["name"]})
+    if proc.returncode != 0:
+        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else f"publish_command skončil s {proc.returncode}")
+    (onnx.parent / f"{sp['name']}.published").touch()
+    return run["name"]
 
 
 def test_inference(cfg, model_path, text, out_wav):
     """Piper runtime inference → WAV (test vytvořeného modelu)."""
     t = cfg["training"]
     py = str(Path(t["piper_venv"]) / "bin" / "python")
-    cmd = [py, "-m", "piper", "-m", str(model_path), "-f", str(out_wav), "--", text]
-    subprocess.run(cmd, check=True, timeout=300)
+    _run_piper([py, "-m", "piper", "-m", str(model_path), "-f", str(out_wav), "--", text], 300)
     return out_wav

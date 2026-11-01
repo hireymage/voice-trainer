@@ -8,6 +8,8 @@ After=network-online.target
 ExecStart=%h/voice-trainer/bin/voice-trainer api
 Restart=always
 RestartSec=10
+# Trénink spuštěný z aplikace je potomek API; restart API ho nesmí zabít.
+KillMode=process
 
 [Install]
 WantedBy=default.target

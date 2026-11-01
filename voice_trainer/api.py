@@ -17,6 +17,11 @@ Přístup hlídá Bearer token ze souboru <data_root>/api-token; ZeroTier šifru
   GET    /recordings?speaker=…&q=…&offset=…&limit=…
   GET    /recordings/<id>/audio      audio/flac
   DELETE /recordings/<id>            přesune soubory do dataset/trash, věta jde zpět do fronty
+  GET    /training?speaker=…         stav tréninku hlasu, procenta, odhad času
+  POST   /training/start             {"speaker"} spustí trénink
+  POST   /training/stop              {"speaker"} zastaví trénink, další na něj naváže
+  POST   /training/test              {"speaker","text"} věta posledním stavem hlasu, audio/flac
+  POST   /training/publish           {"speaker"} spustí publish_command z configu
 """
 import datetime
 import hmac
@@ -30,6 +35,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +53,11 @@ MAX_UPLOAD = 40 * 1024 * 1024
 UPLOAD_ID = re.compile(r"^app_[0-9a-f]{24}$")
 SPEAKER_NAME = re.compile(r"^[\w -]{1,40}$", re.UNICODE)
 UPLOAD_MAX_AGE_S = 24 * 3600
+MIN_TRAINING_PASSES = 4
+MAX_TEST_TEXT = 500
+# server běží ve více vláknech: dvě klepnutí nesmí spustit dva tréninky ani dva exporty
+START_LOCK = threading.Lock()
+MODEL_LOCK = threading.Lock()
 
 
 class ApiError(Exception):
@@ -227,6 +238,10 @@ def recording_audio(cfg, db, rid):
                              ds.wav_dir(cfg, sp["name"]) / name) if p.exists()), None)
     if path is None:
         raise ApiError(404, "soubor nahrávky chybí")
+    return flac_bytes(path)
+
+
+def flac_bytes(path):
     proc = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
          "-c:a", "flac", "-f", "flac", "-"], capture_output=True, timeout=60)
@@ -274,6 +289,89 @@ def set_language(cfg, db, name, data):
     if db.speaker(sid)["language"] != code and db.speaker_has_data(sid):
         raise ApiError(409, "hlas už má nahrávky, jazyk nejde změnit; pro jiný jazyk vytvoř nový hlas")
     return run_cli(cfg, "speaker-language", "--name", name, "--language", code)
+
+
+def speaker_id_of(db, name):
+    sid = db.speaker_id(name)
+    if sid is None:
+        raise ApiError(404, f"neznámý mluvčí {name}")
+    return sid
+
+
+def training_status(cfg, db, name):
+    sid = speaker_id_of(db, name)
+    speaker = db.speaker(sid)
+    ckpt, _ = tr.trained_checkpoint(db, sid)
+    return {**tr.progress(db, cfg, sid),
+            "gpu_busy": tr.training_running(cfg),
+            "busy_speaker": tr.busy_speaker(db, sid),
+            "can_test": ckpt is not None,
+            "can_publish": ckpt is not None and bool(cfg.get("publish_command")),
+            "published_at": tr.published_at(cfg, speaker["name"]),
+            "min_passes": MIN_TRAINING_PASSES,
+            "test_text": languages.get(cfg, speaker["language"])["test_sentence"]}
+
+
+def start_training(cfg, db, name):
+    sid = speaker_id_of(db, name)
+    if db.stats(sid)[0] < MIN_TRAINING_PASSES:
+        raise ApiError(409, f"na trénink jsou potřeba aspoň {MIN_TRAINING_PASSES} nahrávky")
+    with START_LOCK:
+        if tr.training_running(cfg):
+            raise ApiError(409, "trénink už běží")
+        try:
+            info = tr.start_training(db, cfg, speaker_id=sid)
+        except SystemExit as e:  # společná logika s CLI, tam je to konec příkazu
+            raise ApiError(409, str(e)) from e
+    log.info("trénink %s spuštěn z aplikace (mluvčí %s)", info["run"], name)
+    return training_status(cfg, db, name)
+
+
+def stop_training(cfg, db, name):
+    run = db.latest_run(speaker_id=speaker_id_of(db, name))
+    if run is None or not tr.run_alive(run):
+        raise ApiError(409, "trénink tohoto hlasu neběží")
+    restarted = tr.stop_run(db, cfg, run)
+    log.info("trénink %s zastaven z aplikace, znovu spuštěno: %s", run["name"], restarted)
+    return training_status(cfg, db, name)
+
+
+def test_voice(cfg, db, data):
+    sid = speaker_id_of(db, str(data.get("speaker", "")))
+    language = db.speaker(sid)["language"]
+    text = str(data.get("text") or "").strip() or languages.get(cfg, language)["test_sentence"]
+    if not text:
+        raise ApiError(400, "chybí text")
+    if len(text) > MAX_TEST_TEXT:
+        raise ApiError(400, f"text je delší než {MAX_TEST_TEXT} znaků")
+    if not MODEL_LOCK.acquire(blocking=False):
+        raise ApiError(409, "model se právě připravuje")
+    try:
+        model = tr.app_model(db, cfg, sid)
+        if model is None:
+            raise ApiError(409, "hlas zatím nemá natrénovaný stav")
+        with tempfile.TemporaryDirectory(prefix="vt-api-") as tmp:
+            wav = Path(tmp) / "test.wav"
+            tr.test_inference(cfg, model[0], text, wav)
+            return flac_bytes(wav)
+    finally:
+        MODEL_LOCK.release()
+
+
+def publish_voice(cfg, db, name):
+    sid = speaker_id_of(db, name)
+    if not cfg.get("publish_command"):
+        raise ApiError(409, "server nemá nastavený publish_command")
+    if not MODEL_LOCK.acquire(blocking=False):
+        raise ApiError(409, "model se právě připravuje")
+    try:
+        run = tr.publish_model(db, cfg, sid)
+    finally:
+        MODEL_LOCK.release()
+    if run is None:
+        raise ApiError(409, "hlas zatím nemá natrénovaný stav")
+    log.info("model hlasu %s nasazen (%s)", name, run)
+    return training_status(cfg, db, name)
 
 
 def make_handler(cfg, token):
@@ -369,6 +467,19 @@ def make_handler(cfg, token):
                 return recording_audio(cfg, db, int(parts[1]))
             if route == ("DELETE", "recordings") and len(parts) == 2:
                 return delete_recording(cfg, db, int(parts[1]))
+            if route == ("GET", "training") and len(parts) == 1:
+                return training_status(cfg, db, query.get("speaker", [""])[0])
+            if route == ("POST", "training") and len(parts) == 2:
+                data = self._data()
+                speaker = str(data.get("speaker", ""))
+                if parts[1] == "start":
+                    return start_training(cfg, db, speaker)
+                if parts[1] == "stop":
+                    return stop_training(cfg, db, speaker)
+                if parts[1] == "test":
+                    return test_voice(cfg, db, data)
+                if parts[1] == "publish":
+                    return publish_voice(cfg, db, speaker)
             raise ApiError(404, "neznámá adresa")
 
         def _handle(self, method):

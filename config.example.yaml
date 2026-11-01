@@ -45,6 +45,7 @@ training:
   fallback_sample_rate: 22050
   highpass_hz: 80         # filtr hučení pozadí při přípravě dat; master zůstává surový (0 = vypnuto)
   speech_level_db: -23    # hlasitost řeči v kopii pro trénink, stálé zesílení na nahrávku (0 = vypnuto)
+  min_free_gpu_mb: 6000   # méně volné paměti na GPU po zastavení služeb → trénink hned skončí chybou (0 = nekontrolovat)
   espeak_voice: cs
   devices: 2              # 2× GTX 1080 Ti (DDP)
   strategy: ddp
@@ -74,6 +75,13 @@ gpu_lane_units:
   - llama-server-b.service
   - llama-server-bonsai0.service
   - llama-server-bonsai1.service
+# Které z nich trénink po skončení zase spustí (výchozí: žádnou, sudo musí dovolit i start).
+gpu_restart_units: []
+
+# ── nasazení modelu ──────────────────────────────────────────────────────────
+# Tlačítko Nasadit v aplikaci spustí tenhle příkaz (shell) na serveru. Dostane VT_MODEL,
+# VT_MODEL_CONFIG, VT_SPEAKER, VT_LANGUAGE a VT_RUN. Prázdné = aplikace tlačítko nenabídne.
+publish_command: ""
 
 # ── quality ──────────────────────────────────────────────────────────────────
 quality:

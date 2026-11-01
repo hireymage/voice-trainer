@@ -32,6 +32,7 @@ LANGUAGES = {
     "cs": {
         "name": "Čeština",
         "espeak_voice": "cs",
+        "test_sentence": "Ahoj, tohle je zkouška mého vlastního hlasu.",
         # téma se losuje na každou dávku, jinak model krouží pořád kolem počasí/dopravy/nákupu
         # (TTS dataset potřebuje hlavně fonetickou rozmanitost)
         "topics": [
@@ -71,6 +72,7 @@ LANGUAGES = {
         "name": "English",
         "english_name": "English",
         "espeak_voice": "en-us",
+        "test_sentence": "Hello, this is a test of my own voice.",
         # celá slova: kmen "ten" by schoval i "tennis"
         "number_words": (
             "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
@@ -92,6 +94,7 @@ def _complete(code, entry):
         "english_name": entry.get("english_name") or name,
         "espeak_voice": entry.get("espeak_voice") or code,
         "stt_language": entry.get("stt_language") or code,
+        "test_sentence": entry.get("test_sentence") or "",
         "prompt": entry.get("prompt") or GENERIC_PROMPT,
         "topics": list(entry.get("topics") or GENERIC_TOPICS),
         "number_stems": tuple(entry.get("number_stems") or ()),

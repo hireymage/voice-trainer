@@ -72,10 +72,23 @@ def main():
     gpus = tr.gpu_status()
     log(run_dir, "GPU před stopnutím lanes: " + json.dumps(gpus))
     stopped = tr.stop_lanes(cfg)
+    json.dump(stopped, open(Path(run_dir) / "stopped_units.json", "w"))
     log(run_dir, f"stopnuté lanes: {stopped or 'žádné'}")
     time.sleep(3)
     gpus = tr.gpu_status()
     log(run_dir, "GPU po stopnutí lanes: " + json.dumps(gpus))
+    # cizí proces na GPU by fit shodil až po přípravě dat a s nesrozumitelnou chybou
+    min_free = int(cfg["training"].get("min_free_gpu_mb") or 0)
+    short = [g for g in gpus[:int(req["devices"])] if g["free_mb"] < min_free]
+    if short:
+        reason = "málo volné paměti GPU: " + ", ".join(
+            f"GPU {g['index']} má {g['free_mb']} MiB, potřeba {min_free} MiB" for g in short)
+        log(run_dir, reason)
+        db.update_run(req["run_id"], "failed", notes=reason)
+        write_status(run_dir, {"status": "failed", "reason": reason, "dataset": d,
+                               "run": req["run_name"]})
+        tr.restart_lanes(cfg, run_dir)
+        return
     write_status(run_dir, {"status": "preparing", "gpus": gpus,
                            "dataset": d, "run": req["run_name"]})
 
@@ -140,6 +153,9 @@ def main():
     write_status(run_dir, {"status": status, "dataset": d,
                            "return_code": rc, "minutes": round(mins, 1),
                            "run": req["run_name"]})
+    restarted = tr.restart_lanes(cfg, run_dir)
+    if restarted:
+        log(run_dir, f"znovu spuštěné lanes: {restarted}")
 
 
 if __name__ == "__main__":
@@ -148,8 +164,9 @@ if __name__ == "__main__":
     except Exception:
         # výpadek GPU/disku nesmí zničit metadata — run označit failed a logovat
         try:
-            log(json.load(open(sys.argv[1]))["run_dir"],
-                "FATAL: " + traceback.format_exc())
+            run_dir = json.load(open(sys.argv[1]))["run_dir"]
+            log(run_dir, "FATAL: " + traceback.format_exc())
+            tr.restart_lanes(load(), run_dir)
         except Exception:
             traceback.print_exc()
         sys.exit(1)

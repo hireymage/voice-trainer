@@ -29,6 +29,7 @@ _DEFAULTS = {
         "fallback_sample_rate": 22050,
         "highpass_hz": 80,
         "speech_level_db": -23,
+        "min_free_gpu_mb": 6000,
         "espeak_voice": "cs",
         "devices": 2,
         "strategy": "ddp",
@@ -47,6 +48,8 @@ _DEFAULTS = {
         "llama-server-bonsai0.service",
         "llama-server-bonsai1.service",
     ],
+    "gpu_restart_units": [],
+    "publish_command": "",
     "quality": {
         "min_duration": 1.0,
         "max_duration": 30.0,

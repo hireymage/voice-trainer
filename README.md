@@ -108,7 +108,10 @@ voice-trainer runs                  # runy + checkpointy (append-only)
 - **Kumulace:** každý run trénuje na VŠECHNY PASS nahrávky k danému datu
   (dataset v2 = v1 + nové). Checkpoint z runu N je base pro run N+1.
 - Trénink běží detached (setsid) — zavření ssh terminálu ho nezastaví.
-- Služby v `gpu_lane_units` se před tréninkem zastaví přes `sudo -n` a po něm se samy nevrací.
+- Služby v `gpu_lane_units` se před tréninkem zastaví přes `sudo -n`. Po tréninku se vrátí jen ty,
+  které jsou i v `gpu_restart_units`. Když pak na GPU zbývá méně než `min_free_gpu_mb`, run hned skončí chybou.
+- Z klienta: `POST /training/start` a `/training/stop`, průběh přes `GET /training`. Zastavený run
+  si nechá `last.ckpt` a další na něj naváže. Aby trénink přežil restart API, má jednotka `KillMode=process`.
 - Checkpointy: Lightning top-5 dle `val_mel` + `last.ckpt` per run dir.
   Starší checkpointy se nikdy nemažou.
 
@@ -122,6 +125,19 @@ voice-trainer test --model export/xxx.onnx --text "Moje testovací věta."
 ```
 
 Výstup: `export/<jméno>-medium.onnx` + `.onnx.json` — hotový Piper model.
+
+Z klienta: `POST /training/test` vrátí větu namluvenou posledním uloženým stavem hlasu, i během tréninku.
+Model pro tenhle účel je v `export/app/` a syntéza běží na serveru bez GPU.
+
+Kam se hotový model nasazuje, je věc konkrétní instalace. `POST /training/publish` proto jen
+spustí `publish_command` z `config.yaml`, například:
+
+```bash
+#!/bin/sh
+set -e
+rsync "$VT_MODEL" "tts-host:voices/$VT_SPEAKER.onnx"
+rsync "$VT_MODEL_CONFIG" "tts-host:voices/$VT_SPEAKER.onnx.json"
+```
 
 ## Robustnost
 
